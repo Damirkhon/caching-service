@@ -60,7 +60,7 @@ known-first-party = ["caching_service", "cache_cli", "tests"]
 [tool.mypy]
 strict = true
 plugins = ["pydantic.mypy"]
-files = ["src", "tests"]
+files = ["src", "tests", "migrations"]
 mypy_path = "src"
 
 [tool.pydantic-mypy]
