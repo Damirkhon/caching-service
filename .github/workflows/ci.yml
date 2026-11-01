@@ -4,10 +4,11 @@ on:
   push:
   pull_request:
 
-# A newer push to the same branch or pull request supersedes the run in progress.
+# A newer push to the same branch or pull request supersedes the run in progress, except on
+# main, where every merge commit must get its own verdict.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
   contents: read
@@ -66,7 +67,9 @@ jobs:
           enable-cache: true
           cache-dependency-glob: uv.lock
       - run: make install
-      - run: make test PYTEST_ARGS="--cov-report=xml"
+      # Any --cov-report replaces the default terminal report, so ask for both: the log must
+      # still list uncovered lines if the coverage gate fails.
+      - run: make test PYTEST_ARGS="--cov-report=term-missing --cov-report=xml"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: coverage-${{ matrix.db }}
