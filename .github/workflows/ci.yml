@@ -4,15 +4,17 @@ on:
   push:
   pull_request:
 
-# A newer push to the same branch or pull request supersedes the run in progress.
+# A newer push to the same branch or pull request supersedes the run in progress, except on
+# main, where every merge commit must get its own verdict.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
   contents: read
 
 env:
+  # Keep in step with the uv base image in the Dockerfile.
   UV_VERSION: "0.12.21"
 
 jobs:
@@ -22,11 +24,17 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Nothing after checkout needs the token, so don't leave it in .git/config.
+          persist-credentials: false
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           version: ${{ env.UV_VERSION }}
           enable-cache: true
           cache-dependency-glob: uv.lock
+          # Jobs share one cache key; saving only from main avoids save collisions between
+          # jobs and keeps feature branches from filling the cache.
+          save-cache: ${{ github.ref == 'refs/heads/main' }}
       # The Makefile runs uv with UV_LOCKED=1, so a stale uv.lock fails here rather than
       # being silently re-resolved: CI must test exactly what the Docker image ships.
       - run: make install
@@ -60,13 +68,21 @@ jobs:
       TEST_DATABASE_URL: ${{ matrix.db == 'postgres' && 'postgresql+asyncpg://test:test@localhost:5432/test' || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Nothing after checkout needs the token, so don't leave it in .git/config.
+          persist-credentials: false
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           version: ${{ env.UV_VERSION }}
           enable-cache: true
           cache-dependency-glob: uv.lock
+          # Jobs share one cache key; saving only from main avoids save collisions between
+          # jobs and keeps feature branches from filling the cache.
+          save-cache: ${{ github.ref == 'refs/heads/main' }}
       - run: make install
-      - run: make test PYTEST_ARGS="--cov-report=xml"
+      # Any --cov-report replaces the default terminal report, so ask for both: the log must
+      # still list uncovered lines if the coverage gate fails.
+      - run: make test PYTEST_ARGS="--cov-report=term-missing --cov-report=xml"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: coverage-${{ matrix.db }}
@@ -80,5 +96,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Nothing after checkout needs the token, so don't leave it in .git/config.
+          persist-credentials: false
       # Builds the image, starts the Compose stack, drives it with cache-cli, tears it down.
       - run: make smoke
