@@ -1,5 +1,6 @@
+import logging
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,16 @@ def clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in os.environ:
         if name.startswith(ENV_PREFIX):
             monkeypatch.delenv(name)
+
+
+@pytest.fixture(autouse=True)
+def restore_package_log_level() -> Iterator[None]:
+    # Starting an app configures the package logger, which is process-global state; without
+    # restoring it, one test's app would change what later tests' log captures see.
+    package = logging.getLogger("caching_service")
+    level = package.level
+    yield
+    package.setLevel(level)
 
 
 @pytest.fixture
