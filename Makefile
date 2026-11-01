@@ -31,8 +31,8 @@ run: ## Run the service locally with auto-reload
 migrate: ## Apply database migrations
 	uv run alembic upgrade head
 
-up: ## Build and start the Docker Compose stack
-	docker compose up --build -d
+up: ## Build and start the Docker Compose stack, returning once it is healthy
+	docker compose up --build --detach --wait
 
 down: ## Stop the Docker Compose stack
 	docker compose down
