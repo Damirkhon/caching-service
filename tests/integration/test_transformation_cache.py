@@ -9,12 +9,14 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from caching_service.db.models import Transformation
 from caching_service.domain.transformer import Transformer
 from caching_service.errors import TransformerError
+from caching_service.services import transformation_cache
 from caching_service.services.single_flight import SingleFlight
 from caching_service.services.transformation_cache import TransformationCache
 from tests.fakes import (
     BlockingTransformer,
     CountingTransformer,
     FailingTransformer,
+    GatedTransformer,
     ObservedSingleFlight,
     SlowTransformer,
 )
@@ -329,3 +331,80 @@ async def test_failed_write_still_logs_and_propagates(
 
     (record,) = caplog.records
     assert record.getMessage() == "transform_many requested=1 unique=1 hits=0 misses=1 failed=0"
+
+
+async def test_finished_but_unstored_result_is_reused_by_another_request(
+    session_factory: SessionFactory, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A request stores its results only once all of its misses finish. Until then, a result
+    # that is already back must still serve other requests instead of costing a second call.
+    transformer = GatedTransformer(gated={"slow"})
+    cache = make_cache(session_factory, transformer)
+
+    first = asyncio.create_task(cache.transform_many(["fast", "slow"]))
+    try:
+        await transformer.wait_until_answered("fast")
+
+        with caplog.at_level(logging.INFO, logger="caching_service.services.transformation_cache"):
+            assert await cache.transform_many(["fast"]) == {"fast": "FAST"}
+    finally:
+        transformer.release.set()
+
+    (record,) = caplog.records
+    assert record.getMessage() == "transform_many requested=1 unique=1 hits=1 misses=0 failed=0"
+    assert await first == {"fast": "FAST", "slow": "SLOW"}
+    assert sorted(transformer.calls) == ["fast", "slow"]
+    assert await stored_count(session_factory) == 2
+
+
+async def test_result_orphaned_by_a_cancelled_request_is_stored_by_the_next_one(
+    session_factory: SessionFactory,
+) -> None:
+    transformer = GatedTransformer(gated={"slow"})
+    cache = make_cache(session_factory, transformer)
+
+    abandoned = asyncio.create_task(cache.transform_many(["fast", "slow"]))
+    try:
+        await transformer.wait_until_answered("fast")
+        abandoned.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await abandoned
+
+        assert await cache.transform_many(["fast"]) == {"fast": "FAST"}
+    finally:
+        transformer.release.set()
+
+    # The still-running call for "slow" outlived its cancelled request, and is reused too.
+    assert await cache.transform_many(["slow"]) == {"slow": "SLOW"}
+    assert sorted(transformer.calls) == ["fast", "slow"]
+    # Served without second calls, and now stored: a fresh cache instance finds both.
+    restarted = CountingTransformer()
+    assert await make_cache(session_factory, restarted).transform_many(["fast", "slow"]) == {
+        "fast": "FAST",
+        "slow": "SLOW",
+    }
+    assert restarted.calls == []
+
+
+async def test_orphaned_results_are_bounded(
+    session_factory: SessionFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(transformation_cache, "MAX_UNSTORED_RESULTS", 1)
+    transformer = GatedTransformer(gated={"slow"})
+    cache = make_cache(session_factory, transformer)
+
+    abandoned = asyncio.create_task(cache.transform_many(["a", "b", "slow"]))
+    try:
+        await transformer.wait_until_answered("a")
+        await transformer.wait_until_answered("b")
+        abandoned.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await abandoned
+
+        # Only the newest orphan is kept: "a" was evicted and costs a second call, "b" doesn't.
+        assert await cache.transform_many(["a", "b"]) == {"a": "A", "b": "B"}
+    finally:
+        transformer.release.set()
+
+    assert transformer.calls.count("a") == 2
+    assert transformer.calls.count("b") == 1
