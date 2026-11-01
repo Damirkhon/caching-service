@@ -80,6 +80,7 @@ async def test_overlapping_input_only_transforms_new_strings(database_url: str) 
     assert sorted(transformer.calls) == ["new one", "new two"]
 
 
+# Any: invalid bodies are deliberately not of the request's shape.
 INVALID_BODIES: list[tuple[str, Any]] = [
     ("unequal-lengths", {"list_1": ["a", "b"], "list_2": ["c"]}),
     ("empty-lists", {"list_1": [], "list_2": []}),

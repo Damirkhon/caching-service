@@ -10,6 +10,7 @@ from caching_service.api.schemas import (
     PayloadCreateRequest,
 )
 
+# Any: invalid bodies are deliberately not of the request's shape.
 INVALID_BODIES: list[tuple[str, Any]] = [
     ("unequal-lengths", {"list_1": ["a", "b"], "list_2": ["c"]}),
     ("empty-lists", {"list_1": [], "list_2": []}),
