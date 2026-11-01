@@ -1,6 +1,5 @@
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable
 from typing import Any, NoReturn
 
 import pytest
@@ -16,6 +15,7 @@ from tests.fakes import (
     BlockingTransformer,
     CountingTransformer,
     FailingTransformer,
+    ObservedSingleFlight,
     SlowTransformer,
 )
 
@@ -28,33 +28,6 @@ DEFAULT_MAX_CONCURRENCY = 10
 # The timeout fires long before the slow fake would answer, so the test never waits for it.
 SHORT_TIMEOUT_SECONDS = 0.05
 SLOW_DELAY_SECONDS = 60.0
-
-
-class ObservedSingleFlight(SingleFlight[str, str]):
-    """Signals once a given number of callers have joined, i.e. are awaiting a shared call.
-
-    SingleFlight.run has no await before it starts waiting on the shared call, so when the
-    counter is bumped the caller is, for scheduling purposes, already waiting.
-    """
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.callers = 0
-        self._target = 0
-        self._reached = asyncio.Event()
-
-    async def run(self, key: str, fn: Callable[[], Awaitable[str]]) -> str:
-        self.callers += 1
-        if self.callers >= self._target:
-            self._reached.set()
-        return await super().run(key, fn)
-
-    async def wait_for_callers(self, count: int) -> None:
-        self._target = count
-        if self.callers >= count:
-            return
-        self._reached.clear()
-        await self._reached.wait()
 
 
 def make_cache(
