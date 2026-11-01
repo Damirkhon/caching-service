@@ -10,6 +10,8 @@ Requires [uv](https://docs.astral.sh/uv/) and Python 3.13.
 
 ```bash
 uv sync        # create .venv and install the locked dependencies
+make check     # lint, type-check and run the tests with coverage
+make help      # list every target
 ```
 
 ## Configuration
@@ -17,6 +19,9 @@ uv sync        # create .venv and install the locked dependencies
 Copy `.env.example` to `.env` and adjust as needed.
 
 ## Development
+
+Install the git hooks once with `uv run pre-commit install`. They run ruff and
+basic file hygiene checks on every commit; `make check` is the full gate.
 
 ## Assumptions
 
