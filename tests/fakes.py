@@ -73,6 +73,34 @@ class BlockingTransformer:
             await self._entered.wait_for(lambda: len(self.calls) >= count)
 
 
+class GatedTransformer:
+    """Answers at once, except for the ``gated`` inputs, which wait until ``release`` is set.
+
+    ``answered`` records each input as its result is returned, so a test can act after one
+    string of a request has finished while another is still held.
+    """
+
+    def __init__(self, gated: Iterable[str]) -> None:
+        self.gated = frozenset(gated)
+        self.calls: list[str] = []
+        self.answered: list[str] = []
+        self.release = asyncio.Event()
+        self._answer = asyncio.Condition()
+
+    async def transform(self, value: str) -> str:
+        self.calls.append(value)
+        if value in self.gated:
+            await self.release.wait()
+        async with self._answer:
+            self.answered.append(value)
+            self._answer.notify_all()
+        return value.upper()
+
+    async def wait_until_answered(self, value: str) -> None:
+        async with self._answer:
+            await self._answer.wait_for(lambda: value in self.answered)
+
+
 class SlowTransformer:
     """Sleeps for ``delay`` seconds; configure it above the caller's timeout to force one."""
 

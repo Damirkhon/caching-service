@@ -15,6 +15,7 @@ from tests.fakes import (
     BlockingTransformer,
     CountingTransformer,
     FailingTransformer,
+    GatedTransformer,
     ObservedSingleFlight,
     SlowTransformer,
 )
@@ -329,3 +330,44 @@ async def test_failed_write_still_logs_and_propagates(
 
     (record,) = caplog.records
     assert record.getMessage() == "transform_many requested=1 unique=1 hits=0 misses=1 failed=0"
+
+
+async def test_finished_but_unstored_result_is_reused_by_another_request(
+    session_factory: SessionFactory,
+) -> None:
+    # A request stores its results only once all of its misses finish. Until then, a result
+    # that is already back must still serve other requests instead of costing a second call.
+    transformer = GatedTransformer(gated={"slow"})
+    cache = make_cache(session_factory, transformer)
+
+    first = asyncio.create_task(cache.transform_many(["fast", "slow"]))
+    await transformer.wait_until_answered("fast")
+
+    assert await cache.transform_many(["fast"]) == {"fast": "FAST"}
+
+    transformer.release.set()
+    assert await first == {"fast": "FAST", "slow": "SLOW"}
+    assert sorted(transformer.calls) == ["fast", "slow"]
+    assert await stored_count(session_factory) == 2
+
+
+async def test_result_orphaned_by_a_cancelled_request_is_stored_by_the_next_one(
+    session_factory: SessionFactory,
+) -> None:
+    transformer = GatedTransformer(gated={"slow"})
+    cache = make_cache(session_factory, transformer)
+
+    abandoned = asyncio.create_task(cache.transform_many(["fast", "slow"]))
+    await transformer.wait_until_answered("fast")
+    abandoned.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await abandoned
+
+    assert await cache.transform_many(["fast"]) == {"fast": "FAST"}
+
+    # Served without a second call, and now stored: a fresh cache instance finds it.
+    assert transformer.calls.count("fast") == 1
+    restarted = CountingTransformer()
+    assert await make_cache(session_factory, restarted).transform_many(["fast"]) == {"fast": "FAST"}
+    assert restarted.calls == []
+    transformer.release.set()
