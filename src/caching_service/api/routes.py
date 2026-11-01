@@ -5,9 +5,10 @@ from typing import Final
 
 from fastapi import APIRouter, Request, Response, status
 
-from caching_service.api.dependencies import PayloadServiceDep
+from caching_service.api.dependencies import HealthServiceDep, PayloadServiceDep
 from caching_service.api.schemas import (
     ErrorResponse,
+    HealthResponse,
     PayloadCreatedResponse,
     PayloadCreateRequest,
     PayloadResponse,
@@ -64,3 +65,24 @@ async def create_payload(
 )
 async def get_payload(payload_id: uuid.UUID, service: PayloadServiceDep) -> PayloadResponse:
     return PayloadResponse(output=await service.get_output(payload_id))
+
+
+# HEAD too, because some load balancers and probes check with it; hidden from the schema so
+# the documented operation stays a single GET.
+@router.head("/health", include_in_schema=False)
+@router.get(
+    "/health",
+    response_model=HealthResponse,
+    summary="Readiness check, including database connectivity",
+    responses={
+        status.HTTP_503_SERVICE_UNAVAILABLE: {
+            "model": HealthResponse,
+            "description": "The database is unreachable.",
+        }
+    },
+)
+async def health(service: HealthServiceDep, response: Response) -> HealthResponse:
+    if await service.database_is_reachable():
+        return HealthResponse(status="ok")
+    response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    return HealthResponse(status="unavailable")

@@ -13,6 +13,7 @@ from caching_service.api.routes import router
 from caching_service.config import LogLevel, Settings
 from caching_service.db.session import create_engine, create_session_factory
 from caching_service.domain.transformer import SimulatedTransformer, Transformer
+from caching_service.services.health import HealthService
 from caching_service.services.payloads import PayloadService
 from caching_service.services.transformation_cache import TransformationCache
 
@@ -45,6 +46,7 @@ def create_app(
                 max_concurrency=resolved.transformer_max_concurrency,
             )
             app.state.payload_service = PayloadService(cache, session_factory)
+            app.state.health_service = HealthService(engine)
             # Not used by the routes; kept so shutdown behaviour can be observed.
             app.state.engine = engine
             yield
