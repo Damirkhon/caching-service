@@ -5,12 +5,13 @@
 A FastAPI microservice that takes two equal-length lists of strings, transforms every string with
 a slow external transformer (simulated here), interleaves the results, and stores the payload
 under an id the client can read it back by. It is built to call the transformer as rarely as
-possible: **a string transformed once is never sent to the transformer again, and a payload
-generated before keeps its original id**. `cache-cli` is a companion command-line tool that
-exercises the service over HTTP.
+possible: **once a string's result is stored, it is never sent to the transformer again, and a
+payload generated before keeps its original id**. `cache-cli` is a companion command-line tool
+that exercises the service over HTTP.
 
-How that guarantee is achieved, and the assumptions, decisions and shortcuts behind it, are in
-[DESIGN.md](DESIGN.md).
+How that guarantee is achieved, the assumptions and decisions behind it, and the shortcuts and
+known limitations (including the narrow cases where a string can be transformed twice) are in
+[DESIGN.md](DESIGN.md#shortcuts-and-future-work).
 
 ## Quick start (Docker)
 
@@ -54,9 +55,9 @@ Each list holds 1–1000 strings of 1–1000 characters. Other error responses:
 
 | Status | When |
 |---|---|
-| `400` | The body is not parseable JSON (for example, nested too deeply) |
-| `413` | The body is larger than any valid request could be |
-| `422` | The body or id is invalid; the response lists each problem without echoing the input |
+| `400` | The body nests deeper than the JSON parser can handle |
+| `413` | The body is larger than any valid request could be (about 25 MB) |
+| `422` | The body is malformed JSON or fails validation, or the id is not a UUID; the response lists each problem without echoing the input |
 | `502` | The transformer failed or timed out; results that succeeded are cached, so a retry is cheaper |
 | `500` | An unexpected error; details are logged, never returned |
 
@@ -71,6 +72,8 @@ cache-cli [-h|--host URL] [-r|--repeat N] [-i|--input FILE|-] [-j|--json JSON] [
 ```
 
 ```bash
+echo '{"list_1": ["a", "b"], "list_2": ["c", "d"]}' > request.json
+
 uv run cache-cli -h http://localhost:8000 -j '{"list_1": ["a", "b"], "list_2": ["c", "d"]}'
 uv run cache-cli -r 3 -i request.json -o results.jsonl
 cat request.json | uv run cache-cli
@@ -95,7 +98,7 @@ It also ships in the Docker image: `docker compose exec -T api cache-cli -r 3 -i
   change the target. The HTTP client still honours the standard proxy and TLS variables
   (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `SSL_CERT_FILE`).
 - Exit codes: `0` success; `1` the service is unreachable, timed out, failed, or returned
-  different ids for the same request; `2` invalid arguments or input, including the service
+  different ids for the same request; `2` invalid arguments, input or output path, including the service
   rejecting the request with `422`; `130` interrupted with Ctrl-C; `141` the output pipe was
   closed early (for example `cache-cli -r 100 | head -1`).
 
@@ -125,8 +128,14 @@ role may create databases (the migration tests create a throwaway one):
 
 ```bash
 docker run -d --name test-pg -p 5432:5432 -e POSTGRES_PASSWORD=test postgres:17.11-alpine
+until docker exec test-pg pg_isready -h 127.0.0.1 -U postgres; do sleep 1; done
 TEST_DATABASE_URL=postgresql+asyncpg://postgres:test@localhost:5432/postgres make test
+docker rm -f test-pg
 ```
+
+To run a subset without the coverage gate, call pytest directly, for example only the unit
+tests: `uv run pytest -m 'not integration and not e2e'`. `make test` and `make check` always run
+the whole suite with the 90% coverage gate.
 
 CI runs lint and type checks, the test suite on SQLite and on PostgreSQL, and the Docker smoke
 test on every push.
@@ -150,13 +159,13 @@ Invalid values stop the service at startup with a clear error.
 
 - The image also runs on its own, serving SQLite from a volume:
   `docker build -t caching-service . && docker run -p 8000:8000 -v caching-data:/app/data caching-service`.
-- The container applies migrations on start, then runs a single uvicorn worker as PID 1, so
-  `docker stop` shuts it down gracefully. One worker on purpose: concurrent identical work is
-  coalesced within a process, so scale with replicas, not workers.
+- The container applies migrations on start, then `exec`s a single uvicorn worker, so it
+  receives the stop signal directly and `docker stop` shuts it down gracefully. One worker on
+  purpose: concurrent identical work is coalesced within a process, so scale with replicas, not
+  workers.
 - It runs as an unprivileged user that can write only to `/app/data`, and reports its health
   through `GET /health`.
-- The Compose credentials are throwaway local values; a real deployment would take them from a
-  secret store.
+- The Compose credentials are throwaway local values (see [DESIGN.md](DESIGN.md#shortcuts-and-future-work)).
 
 ## Project layout
 

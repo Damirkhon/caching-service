@@ -11,12 +11,16 @@ removes one specific way a redundant call could happen.
 
 - **Persistent cache, one lookup per request.** Every transformed string is stored, keyed by a
   SHA-256 of the exact input. A request looks up all of its strings in a single batched query,
-  and only misses go to the transformer. A string transformed once is never sent again.
+  and only misses go to the transformer. Once a result is stored, that string is never sent
+  again (see the shortcuts below for the windows before it is stored).
 - **Duplicates within a request cost one call.** Inputs are deduplicated (keeping first-seen
   order) before the lookup, so `["a", "a"]` + `["a", "b"]` makes at most two calls.
 - **Concurrent requests share calls (single-flight).** If two requests miss the same string at
   the same moment, one transformer call runs and both await it. The call runs as its own
   shielded task, so a client disconnecting never cancels work another request is waiting on.
+  A result that is back but not yet stored (its request is still waiting on slower strings)
+  is reused from memory, and a request that reuses one stores it too, which also rescues
+  results whose own request was cancelled.
 - **No database transaction spans a transformer call.** The cache is read in one short session
   and written in another; the slow calls happen in between, holding no connection. On SQLite
   that also keeps the write lock free; on PostgreSQL it keeps the pool free.
@@ -30,8 +34,9 @@ is an `INSERT ... ON CONFLICT DO NOTHING` followed by a lookup, so the database 
 winner even when identical requests race. Repeating an input costs no transformer calls, because
 every string is already cached.
 
-Every request logs one line with counts only (`requested`, `unique`, `hits`, `misses`,
-`failed`), never the strings themselves, so the container logs show the cache at work.
+Every payload creation logs one line with counts only (`requested`, `unique`, `hits`, `misses`,
+`failed`), and every transformer call logs the input's length, never the strings themselves, so
+the container logs show the cache at work: a repeated request logs no transformer calls.
 
 ## Data model
 
@@ -54,7 +59,7 @@ and can't deadlock on PostgreSQL.
 | Cache keys are the exact strings: no trimming, case folding or Unicode normalization. | We can't know what the external service treats as equal, so `"a"`, `"a "` and `"A"` are separate entries. |
 | The output joins the interleaved transformed strings with `", "`. | One separator constant in the domain module. |
 | "Payload files" means stored payloads, not files on disk. | Payloads live in the database next to the cache: one storage system, atomic writes. |
-| Inputs must be bounded. | Each list has 1–1000 strings of 1–1000 characters; bodies larger than any valid request are refused with `413` before being read. |
+| Inputs must be bounded. | Each list has 1–1000 strings of 1–1000 characters; bodies larger than any valid request are refused with `413` before being buffered in full. |
 | One service process is the deployment target. | In-process single-flight is enough; see the shortcuts below for several replicas. |
 
 Questions the task leaves open, and the defaults chosen:
@@ -73,7 +78,7 @@ Questions the task leaves open, and the defaults chosen:
 |---|---|---|
 | Async throughout (FastAPI, SQLAlchemy asyncio, aiosqlite/asyncpg) | Sync routes in a thread pool | The workload waits on a slow external service; asyncio makes concurrent misses and call coalescing simple. |
 | SQLAlchemy 2 typed ORM | SQLModel | Dialect-specific `ON CONFLICT` is first-class, and keeping API schemas separate from tables stops storage details leaking into the HTTP contract. |
-| PostgreSQL in Compose, SQLite for local development and the default test run, the same suite on both in CI | One database | Postgres shows a production-like deployment; SQLite keeps tests fast with nothing to install; running both catches dialect drift, which is isolated in one helper. |
+| PostgreSQL in Compose, SQLite for local development and the default test run, the same suite on both in CI | One database | Postgres shows a production-like deployment; SQLite keeps tests fast with nothing to install; running both catches dialect drift; the one SQL difference, the conflict-ignoring insert, is isolated in one helper. |
 | Deduplicate payloads by output hash | By input fingerprint | Covers both readings of "same payload" with one mechanism, at no extra transformer cost. |
 | In-process single-flight | A distributed lock | Matches the single-process target at almost no cost. |
 | Alembic migrations, run by the container entrypoint | `create_all()` at startup | Versioned, reviewable schema changes. Tests use `create_all` for speed, and a test checks that the migrations match the models. |
@@ -85,8 +90,8 @@ Questions the task leaves open, and the defaults chosen:
 
 | Situation | Status |
 |---|---|
-| Invalid body or id | `422`, in FastAPI's format, without echoing the rejected input |
-| Body not parseable as JSON (for example, nested too deeply) | `400` |
+| Malformed JSON, an invalid body, or an id that is not a UUID | `422`, in FastAPI's format, without echoing the rejected input |
+| Body nested deeper than the JSON parser can handle | `400` |
 | Body larger than any valid request | `413` |
 | Unknown payload id | `404` |
 | Transformer failure or timeout, after storing the successes | `502` |
@@ -103,11 +108,13 @@ These are deliberate, and each has a known next step.
   on different instances can each call the transformer once. Results stay correct, because
   writes are idempotent. The fix is a PostgreSQL advisory lock or a Redis lock keyed by the input
   hash. For the same reason the container runs one uvicorn worker; scale with replicas.
-- **Two narrow windows for a duplicate call.** A single-flight entry is released when the
-  transformer returns, slightly before its result is committed, so a request reading the cache
-  in that moment calls again. And if every request waiting on a call is cancelled, the call
-  still finishes but nobody stores the result. Both cost one extra call, never a wrong result;
-  closing them would need per-key write transactions or a cross-request result map.
+- **One narrow window for a duplicate call.** A request stores its results in one write after
+  all of its misses finish, so finished results are kept visible to other requests in memory
+  until that write commits, and lookups check them before and after the database read. What
+  remains: a value still being transformed when a request's read starts, and stored before that
+  read ends, can cost one duplicate call. That memory is capped at 10,000 results (oldest
+  evicted), which only matters for results orphaned by a cancelled request or a failed write;
+  an eviction can likewise cost one duplicate call. Never a wrong result.
 - **No invalidation or versioning.** If the transformer's behaviour could change, a
   `transformer_version` column would join the cache key.
 - **No authentication, rate limiting or proxy-level request limits.** Assumed to live at an API
@@ -119,8 +126,9 @@ These are deliberate, and each has a known next step.
 - **Payloads are kept forever.** Retention isn't specified.
 - **Migrations run on container start.** Right for one replica; with several, they would move to
   a one-off job.
-- **Image size.** About 240 MB uncompressed (66 MB compressed), mostly real runtime
-  dependencies: SQLAlchemy, asyncpg and uvloop. Dropping uvicorn's `[standard]` extras would save
-  about 20 MB at some cost in server performance.
+- **Image size.** About 240 MB uncompressed (66 MB compressed): roughly 145 MB is the Python
+  slim base image and 95 MB the virtual environment, mostly SQLAlchemy, asyncpg and uvloop.
+  Dropping uvicorn's `[standard]` extras would save about 20 MB at some cost in server
+  performance.
 - **The Compose credentials are throwaway local values.** A real deployment would read them from
   a secret store.
