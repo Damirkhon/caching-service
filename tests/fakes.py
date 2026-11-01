@@ -1,9 +1,10 @@
 """Transformer fakes that make call counts, failures and timing observable in tests."""
 
 import asyncio
-from collections.abc import Iterable
+from collections.abc import Awaitable, Callable, Iterable
 
 from caching_service.errors import TransformerError
+from caching_service.services.single_flight import SingleFlight
 
 
 class CountingTransformer:
@@ -83,3 +84,30 @@ class SlowTransformer:
         self.calls.append(value)
         await asyncio.sleep(self.delay)
         return value.upper()
+
+
+class ObservedSingleFlight(SingleFlight[str, str]):
+    """Signals once a given number of callers have joined, i.e. are awaiting a shared call.
+
+    SingleFlight.run has no await before it starts waiting on the shared call, so when the
+    counter is bumped the caller is, for scheduling purposes, already waiting.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.callers = 0
+        self._target = 0
+        self._reached = asyncio.Event()
+
+    async def run(self, key: str, fn: Callable[[], Awaitable[str]]) -> str:
+        self.callers += 1
+        if self.callers >= self._target:
+            self._reached.set()
+        return await super().run(key, fn)
+
+    async def wait_for_callers(self, count: int) -> None:
+        self._target = count
+        if self.callers >= count:
+            return
+        self._reached.clear()
+        await self._reached.wait()
