@@ -20,8 +20,8 @@ lint: ## Lint and check formatting
 typecheck: ## Type-check with mypy --strict
 	uv run mypy
 
-test: ## Run the tests with the coverage gate
-	uv run pytest --cov
+test: ## Run the tests with the coverage gate (extra flags via PYTEST_ARGS)
+	uv run pytest --cov $(PYTEST_ARGS)
 
 check: lint typecheck test ## The gate every commit must pass
 

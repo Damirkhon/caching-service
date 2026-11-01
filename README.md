@@ -1,5 +1,7 @@
 # Caching Service
 
+[![CI](https://github.com/Damirkhon/caching-service/actions/workflows/ci.yml/badge.svg)](https://github.com/Damirkhon/caching-service/actions/workflows/ci.yml)
+
 A FastAPI microservice that caches the results of a slow external string
 transformer in a database and builds interleaved payloads from them, plus
 `cache-cli`, a command-line tool that exercises the service over HTTP.
