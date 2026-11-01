@@ -16,7 +16,8 @@ make help      # list every target
 
 ## Configuration
 
-Copy `.env.example` to `.env` and adjust as needed.
+Copy `.env.example` to `.env` and adjust as needed. The file is read from the current
+working directory, so run commands from the repository root.
 
 ## Development
 
