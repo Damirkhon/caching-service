@@ -50,20 +50,37 @@ class TransformationCache:
             cached = await TransformationRepository(session).get_many(unique)
         misses = [value for value in unique if value not in cached]
 
-        fresh: dict[str, str] = {}
-        if misses:
-            outputs = await asyncio.gather(*(self._transform_one(value) for value in misses))
-            fresh = dict(zip(misses, outputs, strict=True))
-            async with self._session_factory.begin() as session:
-                await TransformationRepository(session).add_many(fresh)
-
-        logger.info(
-            "transform_many requested=%d unique=%d hits=%d misses=%d",
-            len(values),
-            len(unique),
-            len(cached),
-            len(misses),
+        outcomes = await asyncio.gather(
+            *(self._transform_one(value) for value in misses), return_exceptions=True
         )
+        fresh = {
+            value: outcome
+            for value, outcome in zip(misses, outcomes, strict=True)
+            if isinstance(outcome, str)
+        }
+        failures = [
+            _as_failure(outcome) for outcome in outcomes if isinstance(outcome, BaseException)
+        ]
+
+        try:
+            # Stored before any error is raised, so a retry only pays for the values that
+            # failed. A database error here takes precedence over transformer failures.
+            if fresh:
+                async with self._session_factory.begin() as session:
+                    await TransformationRepository(session).add_many(fresh)
+        finally:
+            logger.info(
+                "transform_many requested=%d unique=%d hits=%d misses=%d failed=%d",
+                len(values),
+                len(unique),
+                len(cached),
+                len(misses),
+                len(failures),
+            )
+        if failures:
+            # Anything but a transformer failure is a bug and takes precedence, so it surfaces
+            # as an internal error with its traceback instead of a "please retry" response.
+            raise next((f for f in failures if not isinstance(f, TransformerError)), failures[0])
         return cached | fresh
 
     async def _transform_one(self, value: str) -> str:
@@ -78,3 +95,14 @@ class TransformationCache:
                     return await self._transformer.transform(value)
             except TimeoutError as exc:
                 raise TransformerError from exc
+
+
+def _as_failure(outcome: BaseException) -> BaseException:
+    # A shared call cancelled underneath this request (e.g. at shutdown) failed it, but the
+    # request itself was not cancelled: re-raising CancelledError would make it look as if it
+    # had been, and skip the error responses entirely.
+    if isinstance(outcome, asyncio.CancelledError):
+        error = TransformerError()
+        error.__cause__ = outcome
+        return error
+    return outcome

@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, NoReturn
 
 import pytest
 from sqlalchemy import event, func, select
@@ -12,7 +12,12 @@ from caching_service.domain.transformer import Transformer
 from caching_service.errors import TransformerError
 from caching_service.services.single_flight import SingleFlight
 from caching_service.services.transformation_cache import TransformationCache
-from tests.fakes import BlockingTransformer, CountingTransformer, SlowTransformer
+from tests.fakes import (
+    BlockingTransformer,
+    CountingTransformer,
+    FailingTransformer,
+    SlowTransformer,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -195,7 +200,7 @@ async def test_logs_counts_but_never_values(
 
     (record,) = caplog.records
     # The exact message: counts only, so no request value can appear in it.
-    assert record.getMessage() == "transform_many requested=3 unique=2 hits=1 misses=1"
+    assert record.getMessage() == "transform_many requested=3 unique=2 hits=1 misses=1 failed=0"
 
 
 async def test_timeout_raises_transformer_error_and_caches_nothing(
@@ -226,3 +231,128 @@ async def test_concurrent_calls_never_exceed_the_limit(session_factory: SessionF
     assert await request == {v: v.upper() for v in "abcde"}
     assert len(transformer.calls) == 5
     assert transformer.peak == max_concurrency
+
+
+async def test_successes_are_persisted_when_some_values_fail(
+    session_factory: SessionFactory,
+) -> None:
+    failing = FailingTransformer(fail_on={"bad"})
+
+    with pytest.raises(TransformerError):
+        await make_cache(session_factory, failing).transform_many(["ok", "bad"])
+
+    retry = CountingTransformer()
+    result = await make_cache(session_factory, retry).transform_many(["ok", "bad"])
+
+    assert result == {"ok": "OK", "bad": "BAD"}
+    assert retry.calls == ["bad"]
+
+
+async def test_unexpected_errors_propagate_unwrapped_after_persisting_successes(
+    session_factory: SessionFactory,
+) -> None:
+    buggy = FailingTransformer(fail_on={"bug"}, error=RuntimeError)
+
+    with pytest.raises(RuntimeError):
+        await make_cache(session_factory, buggy).transform_many(["ok", "bug"])
+
+    assert await stored_count(session_factory) == 1
+
+
+async def test_failures_are_counted_in_the_log(
+    session_factory: SessionFactory, caplog: pytest.LogCaptureFixture
+) -> None:
+    failing = FailingTransformer(fail_on={"bad"})
+
+    with (
+        caplog.at_level(logging.INFO, logger="caching_service.services.transformation_cache"),
+        pytest.raises(TransformerError),
+    ):
+        await make_cache(session_factory, failing).transform_many(["ok", "bad"])
+
+    (record,) = caplog.records
+    assert record.getMessage() == "transform_many requested=2 unique=2 hits=0 misses=2 failed=1"
+
+
+async def test_cancelled_request_does_not_cancel_a_shared_call(
+    session_factory: SessionFactory,
+) -> None:
+    transformer = BlockingTransformer()
+    flights = ObservedSingleFlight()
+    cache = make_cache(session_factory, transformer, flights)
+
+    # The leaver starts the shared call, the harder case: its cancellation must not take the
+    # call down with it.
+    leaver = asyncio.create_task(cache.transform_many(["k"]))
+    await flights.wait_for_callers(1)
+    survivor = asyncio.create_task(cache.transform_many(["k"]))
+    await flights.wait_for_callers(2)
+
+    leaver.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await leaver
+    transformer.release.set()
+
+    assert await survivor == {"k": "K"}
+    assert transformer.calls == ["k"]
+    assert await stored_count(session_factory) == 1
+
+
+class MixedFailureTransformer:
+    """Fails one value as the transformer would and another as a bug would."""
+
+    async def transform(self, value: str) -> str:
+        if value == "bad":
+            raise TransformerError
+        if value == "bug":
+            raise RuntimeError
+        return value.upper()
+
+
+async def test_unexpected_error_wins_over_transformer_errors(
+    session_factory: SessionFactory,
+) -> None:
+    cache = make_cache(session_factory, MixedFailureTransformer())
+
+    with pytest.raises(RuntimeError):
+        await cache.transform_many(["bad", "bug", "ok"])
+
+    assert await stored_count(session_factory) == 1
+
+
+class CancellingTransformer:
+    """A call that ends cancelled, as an in-flight call does when the process shuts down."""
+
+    async def transform(self, value: str) -> str:
+        raise asyncio.CancelledError
+
+
+async def test_shared_call_cancelled_underneath_a_request_is_a_transformer_error(
+    session_factory: SessionFactory,
+) -> None:
+    with pytest.raises(TransformerError) as exc_info:
+        await make_cache(session_factory, CancellingTransformer()).transform_many(["k"])
+
+    assert isinstance(exc_info.value.__cause__, asyncio.CancelledError)
+
+
+class UnwritableSessionFactory(async_sessionmaker[AsyncSession]):
+    """Reads work; opening a write transaction fails, as it would with the database down."""
+
+    def begin(self) -> NoReturn:
+        raise ConnectionError
+
+
+async def test_failed_write_still_logs_and_propagates(
+    engine: AsyncEngine, caplog: pytest.LogCaptureFixture
+) -> None:
+    cache = make_cache(UnwritableSessionFactory(engine), CountingTransformer())
+
+    with (
+        caplog.at_level(logging.INFO, logger="caching_service.services.transformation_cache"),
+        pytest.raises(ConnectionError),
+    ):
+        await cache.transform_many(["a"])
+
+    (record,) = caplog.records
+    assert record.getMessage() == "transform_many requested=1 unique=1 hits=0 misses=1 failed=0"
