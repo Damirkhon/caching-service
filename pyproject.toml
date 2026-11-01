@@ -74,6 +74,8 @@ testpaths = ["tests"]
 addopts = "-ra --strict-markers --strict-config"
 # A deadlocked concurrency test fails instead of hanging the run.
 timeout = 30
+# Deprecations surface as failures now rather than as breakage on the next upgrade.
+filterwarnings = ["error"]
 markers = [
     "integration: runs against a real database",
     "e2e: drives the CLI against a real app",
@@ -82,6 +84,9 @@ markers = [
 [tool.coverage.run]
 source = ["caching_service", "cache_cli"]
 branch = true
+# SQLAlchemy's async layer runs database calls on greenlets; without this, lines after
+# an `await session...` are misreported as uncovered.
+concurrency = ["greenlet", "thread"]
 
 [tool.coverage.report]
 fail_under = 90
