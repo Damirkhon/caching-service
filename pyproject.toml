@@ -33,6 +33,7 @@ dev = [
     "pytest>=9.2.0",
     "pytest-asyncio>=1.4.1",
     "pytest-cov>=7.1.0",
+    "pytest-timeout>=2.4.0",
     "ruff>=0.17.3",
 ]
 
@@ -71,6 +72,8 @@ asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 addopts = "-ra --strict-markers --strict-config"
+# A deadlocked concurrency test fails instead of hanging the run.
+timeout = 30
 markers = [
     "integration: runs against a real database",
     "e2e: drives the CLI against a real app",
