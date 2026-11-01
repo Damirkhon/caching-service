@@ -9,13 +9,20 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from caching_service.db.models import Transformation
 from caching_service.domain.transformer import Transformer
+from caching_service.errors import TransformerError
 from caching_service.services.single_flight import SingleFlight
 from caching_service.services.transformation_cache import TransformationCache
-from tests.fakes import BlockingTransformer, CountingTransformer
+from tests.fakes import BlockingTransformer, CountingTransformer, SlowTransformer
 
 pytestmark = pytest.mark.integration
 
 SessionFactory = async_sessionmaker[AsyncSession]
+
+DEFAULT_TIMEOUT_SECONDS = 5.0
+DEFAULT_MAX_CONCURRENCY = 10
+# The timeout fires long before the slow fake would answer, so the test never waits for it.
+SHORT_TIMEOUT_SECONDS = 0.05
+SLOW_DELAY_SECONDS = 60.0
 
 
 class ObservedSingleFlight(SingleFlight[str, str]):
@@ -49,8 +56,17 @@ def make_cache(
     session_factory: SessionFactory,
     transformer: Transformer,
     single_flight: SingleFlight[str, str] | None = None,
+    *,
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
 ) -> TransformationCache:
-    return TransformationCache(session_factory, transformer, single_flight=single_flight)
+    return TransformationCache(
+        session_factory,
+        transformer,
+        timeout_seconds=timeout_seconds,
+        max_concurrency=max_concurrency,
+        single_flight=single_flight,
+    )
 
 
 async def stored_count(session_factory: SessionFactory) -> int:
@@ -180,3 +196,33 @@ async def test_logs_counts_but_never_values(
     (record,) = caplog.records
     # The exact message: counts only, so no request value can appear in it.
     assert record.getMessage() == "transform_many requested=3 unique=2 hits=1 misses=1"
+
+
+async def test_timeout_raises_transformer_error_and_caches_nothing(
+    session_factory: SessionFactory,
+) -> None:
+    transformer = SlowTransformer(delay=SLOW_DELAY_SECONDS)
+    cache = make_cache(session_factory, transformer, timeout_seconds=SHORT_TIMEOUT_SECONDS)
+
+    with pytest.raises(TransformerError) as exc_info:
+        await cache.transform_many(["s"])
+
+    assert isinstance(exc_info.value.__cause__, TimeoutError)
+    assert await stored_count(session_factory) == 0
+
+
+async def test_concurrent_calls_never_exceed_the_limit(session_factory: SessionFactory) -> None:
+    max_concurrency = 2
+    transformer = BlockingTransformer()
+    cache = make_cache(session_factory, transformer, max_concurrency=max_concurrency)
+
+    request = asyncio.create_task(cache.transform_many(["a", "b", "c", "d", "e"]))
+    await transformer.wait_for_calls(max_concurrency)
+
+    # The other three are queued on the limit, so no amount of scheduling lets them start.
+    assert transformer.in_flight == max_concurrency
+
+    transformer.release.set()
+    assert await request == {v: v.upper() for v in "abcde"}
+    assert len(transformer.calls) == 5
+    assert transformer.peak == max_concurrency

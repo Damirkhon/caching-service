@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from caching_service.db.repositories import TransformationRepository
 from caching_service.domain.transformer import Transformer
+from caching_service.errors import TransformerError
 from caching_service.services.single_flight import SingleFlight
 
 logger = logging.getLogger(__name__)
@@ -25,10 +26,15 @@ class TransformationCache:
         session_factory: async_sessionmaker[AsyncSession],
         transformer: Transformer,
         *,
+        timeout_seconds: float,
+        max_concurrency: int,
         single_flight: SingleFlight[str, str] | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._transformer = transformer
+        self._timeout_seconds = timeout_seconds
+        # Process-wide, because it protects the external service, not any single request.
+        self._semaphore = asyncio.Semaphore(max_concurrency)
         self._flights: SingleFlight[str, str] = (
             SingleFlight() if single_flight is None else single_flight
         )
@@ -61,4 +67,14 @@ class TransformationCache:
         return cached | fresh
 
     async def _transform_one(self, value: str) -> str:
-        return await self._flights.run(value, lambda: self._transformer.transform(value))
+        return await self._flights.run(value, lambda: self._call_transformer(value))
+
+    async def _call_transformer(self, value: str) -> str:
+        # Inside single-flight, so callers waiting on someone else's call hold no slot; the
+        # timeout starts once a slot is held, bounding the call rather than the queueing.
+        async with self._semaphore:
+            try:
+                async with asyncio.timeout(self._timeout_seconds):
+                    return await self._transformer.transform(value)
+            except TimeoutError as exc:
+                raise TransformerError from exc
