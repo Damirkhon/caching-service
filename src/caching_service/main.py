@@ -9,6 +9,7 @@ from fastapi import FastAPI
 
 from caching_service import __version__
 from caching_service.api.exception_handlers import register_exception_handlers
+from caching_service.api.middleware import MAX_REQUEST_BYTES, BodySizeLimitMiddleware
 from caching_service.api.routes import router
 from caching_service.config import LogLevel, Settings
 from caching_service.db.session import create_engine, create_session_factory
@@ -54,6 +55,7 @@ def create_app(
             await engine.dispose()
 
     app = FastAPI(title="Caching Service", version=__version__, lifespan=lifespan)
+    app.add_middleware(BodySizeLimitMiddleware, max_bytes=MAX_REQUEST_BYTES)
     app.include_router(router)
     register_exception_handlers(app)
     return app

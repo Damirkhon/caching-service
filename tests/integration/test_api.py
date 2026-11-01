@@ -6,6 +6,7 @@ from typing import Any
 import pytest
 
 from caching_service.api.exception_handlers import MAX_ECHOED_LOCATION_LENGTH
+from caching_service.api.middleware import MAX_REQUEST_BYTES
 from caching_service.api.schemas import MAX_ITEMS, MAX_STRING_LENGTH, SAMPLE_OUTPUT, SAMPLE_REQUEST
 from caching_service.errors import TransformerError
 from caching_service.services import transformation_cache
@@ -238,3 +239,27 @@ async def test_openapi_documents_examples_and_responses(database_url: str) -> No
     assert {"200", "404", "422"} <= set(read["responses"])
     request_schema = schema["components"]["schemas"]["PayloadCreateRequest"]
     assert request_schema["examples"] == [SAMPLE_REQUEST]
+
+
+async def test_oversized_body_returns_413(database_url: str) -> None:
+    transformer = CountingTransformer()
+    async with api_client(database_url, transformer) as client:
+        response = await client.post(
+            "/payload",
+            content=b" " * (MAX_REQUEST_BYTES + 1),
+            headers={"content-type": "application/json"},
+        )
+
+    assert response.status_code == 413
+    assert transformer.calls == []
+
+
+async def test_deeply_nested_json_is_rejected_without_a_server_error(database_url: str) -> None:
+    # Small enough to pass the size limit, deep enough to exhaust the JSON parser's recursion.
+    nested = b"[" * 100_000
+    async with api_client(database_url, CountingTransformer()) as client:
+        response = await client.post(
+            "/payload", content=nested, headers={"content-type": "application/json"}
+        )
+
+    assert response.status_code == 400
