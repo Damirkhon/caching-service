@@ -63,6 +63,12 @@ plugins = ["pydantic.mypy"]
 files = ["src", "tests", "migrations"]
 mypy_path = "src"
 
+[[tool.mypy.overrides]]
+# The CLI flags need AliasChoices (-h and --host for one field). The pydantic plugin flags every
+# such multi-name alias, defaults or not, because it can't type the constructor parameter.
+module = "cache_cli.settings"
+disable_error_code = ["pydantic-alias"]
+
 [tool.pydantic-mypy]
 init_forbid_extra = true
 init_typed = true
