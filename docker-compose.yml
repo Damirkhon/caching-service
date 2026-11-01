@@ -1,0 +1,36 @@
+# Local demo stack: the API on PostgreSQL. The credentials are throwaway local values; a real
+# deployment would take them from a secret store.
+services:
+  api:
+    build: .
+    # A minimal init as PID 1, so a stop signal is honoured even while migrations run.
+    init: true
+    ports:
+      # Overridable so another stack (e.g. the smoke test's) can run alongside this one.
+      - "${API_PORT:-8000}:8000"
+    environment:
+      CACHE_SERVICE_DATABASE_URL: postgresql+asyncpg://cache:cache@db:5432/cache
+      CACHE_SERVICE_TRANSFORMER_LATENCY_SECONDS: "0.5"
+    depends_on:
+      # Migrations run on start, so the database must accept connections first.
+      db:
+        condition: service_healthy
+
+  db:
+    image: postgres:17.11-alpine
+    environment:
+      POSTGRES_USER: cache
+      POSTGRES_PASSWORD: cache
+      POSTGRES_DB: cache
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # Over TCP: on a fresh volume the image first runs a temporary socket-only server, which
+      # would otherwise pass this check before the real one accepts the API's connections.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U cache -d cache"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata:

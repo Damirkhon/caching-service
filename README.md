@@ -50,6 +50,39 @@ Each list holds 1–1000 strings of 1–1000 characters. Other error responses:
 | `502` | The transformer failed or timed out; results that succeeded are cached, so a retry is cheaper |
 | `500` | An unexpected error; details are logged, never returned |
 
+## Running with Docker
+
+The Compose stack runs the API on PostgreSQL; only Docker (with Compose v2.17 or later) is
+needed on the host.
+
+```bash
+make up        # build and start; returns once Postgres and the migrated API are healthy
+make smoke     # build, start, exercise the stack with cache-cli, verify, tear down
+make down      # stop the stack (the database volume is kept)
+```
+
+The API listens on <http://localhost:8000> (set `API_PORT` to use another host port). The CLI
+ships in the same image, so a demo needs nothing installed on the host:
+
+```bash
+docker compose exec api cache-cli -r 3 -j '{"list_1": ["a", "b"], "list_2": ["c", "d"]}'
+```
+
+The image also runs on its own, serving SQLite from a volume:
+
+```bash
+docker build -t caching-service .
+docker run -p 8000:8000 -v caching-data:/app/data caching-service
+```
+
+- The container applies migrations on start, then runs a single uvicorn worker as PID 1, so
+  `docker stop` shuts it down gracefully. One worker on purpose: concurrent identical work is
+  coalesced within a process, so scale with replicas, not workers.
+- It runs as an unprivileged user that can write only to `/app/data`, and reports its health
+  through `GET /health`.
+- The Compose credentials are throwaway local values; a real deployment would take them from a
+  secret store.
+
 ## The `cache-cli` tool
 
 `cache-cli` sends a payload request to the service N times, reads each result back, and writes
