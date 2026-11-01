@@ -2,45 +2,53 @@
 
 [![CI](https://github.com/Damirkhon/caching-service/actions/workflows/ci.yml/badge.svg)](https://github.com/Damirkhon/caching-service/actions/workflows/ci.yml)
 
-A FastAPI microservice that caches the results of a slow external string
-transformer in a database and builds interleaved payloads from them, plus
-`cache-cli`, a command-line tool that exercises the service over HTTP.
+A FastAPI microservice that takes two equal-length lists of strings, transforms every string with
+a slow external transformer (simulated here), interleaves the results, and stores the payload
+under an id the client can read it back by. It is built to call the transformer as rarely as
+possible: **a string transformed once is never sent to the transformer again, and a payload
+generated before keeps its original id**. `cache-cli` is a companion command-line tool that
+exercises the service over HTTP.
 
-## Quickstart
+How that guarantee is achieved, and the assumptions, decisions and shortcuts behind it, are in
+[DESIGN.md](DESIGN.md).
 
-Requires [uv](https://docs.astral.sh/uv/) and Python 3.13.
+## Quick start (Docker)
 
-```bash
-uv sync        # create .venv and install the locked dependencies
-make check     # lint, type-check and run the tests with coverage
-make help      # list every target
-```
-
-## Running the service
+Only Docker (with Compose v2.17 or later) is needed on the host.
 
 ```bash
-make migrate   # create or upgrade the database schema (SQLite in ./data by default)
-make run       # serve on http://127.0.0.1:8000 with auto-reload
+make up        # build and start the API on PostgreSQL; returns once both are healthy
 ```
 
-Interactive API docs are at <http://127.0.0.1:8000/docs>.
+```bash
+curl -i -X POST http://localhost:8000/payload \
+  -H 'content-type: application/json' \
+  -d '{"list_1": ["first string", "second string", "third string"],
+       "list_2": ["other string", "another string", "last string"]}'
+# 201 Created, Location: /payload/<id>, {"id": "<id>", "message": "Payload created."}
 
-### API
+curl http://localhost:8000/payload/<id>
+# {"output": "FIRST STRING, OTHER STRING, SECOND STRING, ANOTHER STRING, THIRD STRING, LAST STRING"}
+```
+
+Repeat the POST and it answers `200` with the same id, without calling the transformer.
+`docker compose logs api` shows each request's cache hits and misses.
+
+```bash
+make smoke     # build, start, exercise the stack with cache-cli, verify, tear down
+make down      # stop the stack (the database volume is kept)
+```
+
+Interactive API docs are at <http://localhost:8000/docs>. Set `API_PORT` to publish the API on
+another host port.
+
+## API
 
 | Method and path | Purpose | Responses |
 |---|---|---|
 | `POST /payload` | Create a payload from two equal-length lists of strings | `201` new payload, `200` an identical payload already existed and its id is reused; both return `{"id", "message"}` and a `Location` header |
 | `GET /payload/{id}` | Read a payload's output | `200 {"output"}`, `404` unknown id |
 | `GET /health` | Readiness, including a database check | `200 {"status": "ok"}`, `503 {"status": "unavailable"}` |
-
-Example:
-
-```bash
-curl -i -X POST http://127.0.0.1:8000/payload \
-  -H 'content-type: application/json' \
-  -d '{"list_1": ["first string", "second string", "third string"],
-       "list_2": ["other string", "another string", "last string"]}'
-```
 
 Each list holds 1–1000 strings of 1–1000 characters. Other error responses:
 
@@ -52,54 +60,23 @@ Each list holds 1–1000 strings of 1–1000 characters. Other error responses:
 | `502` | The transformer failed or timed out; results that succeeded are cached, so a retry is cheaper |
 | `500` | An unexpected error; details are logged, never returned |
 
-## Running with Docker
-
-The Compose stack runs the API on PostgreSQL; only Docker (with Compose v2.17 or later) is
-needed on the host.
-
-```bash
-make up        # build and start; returns once Postgres and the migrated API are healthy
-make smoke     # build, start, exercise the stack with cache-cli, verify, tear down
-make down      # stop the stack (the database volume is kept)
-```
-
-The API listens on <http://localhost:8000> (set `API_PORT` to use another host port). The CLI
-ships in the same image, so a demo needs nothing installed on the host:
-
-```bash
-docker compose exec api cache-cli -r 3 -j '{"list_1": ["a", "b"], "list_2": ["c", "d"]}'
-```
-
-The image also runs on its own, serving SQLite from a volume:
-
-```bash
-docker build -t caching-service .
-docker run -p 8000:8000 -v caching-data:/app/data caching-service
-```
-
-- The container applies migrations on start, then runs a single uvicorn worker as PID 1, so
-  `docker stop` shuts it down gracefully. One worker on purpose: concurrent identical work is
-  coalesced within a process, so scale with replicas, not workers.
-- It runs as an unprivileged user that can write only to `/app/data`, and reports its health
-  through `GET /health`.
-- The Compose credentials are throwaway local values; a real deployment would take them from a
-  secret store.
-
 ## The `cache-cli` tool
 
 `cache-cli` sends a payload request to the service N times, reads each result back, and writes
 one JSON line per iteration with timings. The first iteration pays for the transformer calls;
 later ones are served from the cache and return the same id.
 
-```bash
-uv run cache-cli -r 3 -i request.json
-uv run cache-cli -h http://localhost:8000 -j '{"list_1": ["a", "b"], "list_2": ["c", "d"]}'
-cat request.json | uv run cache-cli -o results.jsonl
-```
-
 ```text
 cache-cli [-h|--host URL] [-r|--repeat N] [-i|--input FILE|-] [-j|--json JSON] [-o|--output FILE|-] [--help]
 ```
+
+```bash
+uv run cache-cli -h http://localhost:8000 -j '{"list_1": ["a", "b"], "list_2": ["c", "d"]}'
+uv run cache-cli -r 3 -i request.json -o results.jsonl
+cat request.json | uv run cache-cli
+```
+
+It also ships in the Docker image: `docker compose exec -T api cache-cli -r 3 -i - < request.json`.
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -123,21 +100,81 @@ cache-cli [-h|--host URL] [-r|--repeat N] [-i|--input FILE|-] [-j|--json JSON] [
   closed early (for example `cache-cli -r 100 | head -1`).
 
 The CLI is a separate package that talks to the service over HTTP only and never imports the
-server code, so it can be installed and used on its own.
+server code, so it can be installed and used on its own. Possible extensions: a `--concurrency K`
+flag to fire iterations in parallel, and an input file holding many requests.
 
-Possible extensions: a `--concurrency K` flag to fire iterations in parallel (exercising the
-service's coalescing of concurrent identical work), and an input file holding many requests.
+## Local development
+
+Requires [uv](https://docs.astral.sh/uv/); it installs Python 3.13 if needed.
+
+```bash
+uv sync        # create .venv and install the locked dependencies
+make migrate   # create or upgrade the schema (SQLite in ./data by default)
+make run       # serve on http://127.0.0.1:8000 with auto-reload
+make check     # lint, format check, mypy --strict, tests with coverage (the gate for every commit)
+make help      # list every target
+```
+
+Install the git hooks once with `uv run pre-commit install`; they run ruff and basic file
+hygiene checks on every commit.
+
+Tests live in `tests/unit`, `tests/integration` (marked `integration`, real database) and
+`tests/e2e` (marked `e2e`, the CLI against a served app). By default they use a temporary SQLite
+file per test. To run the same suite on PostgreSQL, point `TEST_DATABASE_URL` at a database whose
+role may create databases (the migration tests create a throwaway one):
+
+```bash
+docker run -d --name test-pg -p 5432:5432 -e POSTGRES_PASSWORD=test postgres:17.11-alpine
+TEST_DATABASE_URL=postgresql+asyncpg://postgres:test@localhost:5432/postgres make test
+```
+
+CI runs lint and type checks, the test suite on SQLite and on PostgreSQL, and the Docker smoke
+test on every push.
 
 ## Configuration
 
-Copy `.env.example` to `.env` and adjust as needed. The file is read from the current
-working directory, so run commands from the repository root.
+The service reads environment variables prefixed with `CACHE_SERVICE_`. A `.env` file is read
+from the current working directory too; copy `.env.example` to start one.
 
-## Development
+| Variable | Default | Purpose |
+|---|---|---|
+| `CACHE_SERVICE_DATABASE_URL` | `sqlite+aiosqlite:///./data/cache.db` | SQLAlchemy async URL; Compose sets a `postgresql+asyncpg://` URL |
+| `CACHE_SERVICE_TRANSFORMER_LATENCY_SECONDS` | `0.5` | Simulated transformer latency, which makes cache hits visible |
+| `CACHE_SERVICE_TRANSFORMER_TIMEOUT_SECONDS` | `5.0` | Per-call timeout; exceeding it counts as a transformer failure |
+| `CACHE_SERVICE_TRANSFORMER_MAX_CONCURRENCY` | `10` | Process-wide cap on parallel transformer calls (1–1000) |
+| `CACHE_SERVICE_LOG_LEVEL` | `INFO` | Level for the service's own loggers: `DEBUG`, `INFO`, `WARNING` or `ERROR` |
 
-Install the git hooks once with `uv run pre-commit install`. They run ruff and
-basic file hygiene checks on every commit; `make check` is the full gate.
+Invalid values stop the service at startup with a clear error.
 
-## Assumptions
+## Docker details
 
-## Shortcuts
+- The image also runs on its own, serving SQLite from a volume:
+  `docker build -t caching-service . && docker run -p 8000:8000 -v caching-data:/app/data caching-service`.
+- The container applies migrations on start, then runs a single uvicorn worker as PID 1, so
+  `docker stop` shuts it down gracefully. One worker on purpose: concurrent identical work is
+  coalesced within a process, so scale with replicas, not workers.
+- It runs as an unprivileged user that can write only to `/app/data`, and reports its health
+  through `GET /health`.
+- The Compose credentials are throwaway local values; a real deployment would take them from a
+  secret store.
+
+## Project layout
+
+```text
+src/caching_service/
+├── main.py           # create_app() factory and lifespan wiring
+├── config.py         # validated settings (CACHE_SERVICE_* variables)
+├── errors.py         # domain errors
+├── domain/           # pure logic: interleaving, fingerprints, the Transformer protocol
+├── services/         # use cases: transformation cache, single-flight, payloads, health
+├── db/               # ORM models, engine and sessions, repositories
+└── api/              # routes, schemas, error mapping, body size limit
+src/cache_cli/        # the CLI: settings, I/O, HTTP client, runner (talks HTTP only)
+migrations/           # Alembic environment and versions
+tests/                # unit, integration and e2e suites, plus transformer fakes
+scripts/smoke.sh      # Docker smoke test
+Dockerfile, docker-compose.yml, docker-entrypoint.sh
+```
+
+Dependencies point inward: `api` → `services` → `domain` and `db`. The domain layer imports no
+framework code, which a test enforces.
