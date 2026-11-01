@@ -1,5 +1,6 @@
 """Expected failures: each is reported as one line with an exit code, never as a traceback."""
 
+import uuid
 from http import HTTPStatus
 from typing import Final
 
@@ -58,3 +59,13 @@ class ServiceError(CliError):
         self.status = status
         # A 422 means the service rejected our input, which is a usage error, not a failure.
         self.exit_code = EXIT_USAGE if status == HTTPStatus.UNPROCESSABLE_ENTITY else EXIT_FAILURE
+
+
+class ContractError(CliError):
+    """The service returned different payload ids for the same request."""
+
+    def __init__(self, iteration: int, payload_id: uuid.UUID, first_id: uuid.UUID) -> None:
+        super().__init__(
+            f"service broke its contract: iteration {iteration} returned payload {payload_id}, "
+            f"iteration 1 returned {first_id}"
+        )
